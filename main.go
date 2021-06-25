@@ -1,50 +1,164 @@
 package main
 
 import (
-	"errors"
+	"encoding/csv"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
-var errRequestFailed = errors.New("Request failed")
+var baseURL string = "https://kr.indeed.com/jobs?q=python&limit=50"
 
-type requestResult struct {
-	url    string
-	status string
+type extractedJob struct {
+	id       string
+	title    string
+	company  string
+	location string
+	summary  string
 }
 
 func main() {
-	results := make(map[string]string)
-	c := make(chan requestResult)
-	urls := []string{
-		"https://www.airbnb.com/",
-		"https://www.google.com/",
-		"https://www.amazon.com/",
-		"https://www.reddit.com/",
-		"https://www.google.com/",
-		"https://soundcloud.com/",
-		"https://www.facebook.com/",
-		"https://www.instagram.com/",
-		"https://academy.nomadcoders.co/",
+	var jobs []extractedJob
+	c := make(chan []extractedJob)
+
+	pages := getPages()
+	for i := 0; i < pages; i++ {
+		go getPage(i, c)
 	}
 
-	for _, url := range urls {
-		go hitUrl(url, c)
+	for i := 0; i < pages; i++ {
+		extractedJobs := <-c
+		jobs = append(jobs, extractedJobs...)
+
 	}
-	for i := 0; i < len(urls); i++ {
-		result := <-c
-		results[result.url] = result.status
+	writeJobs(jobs)
+	fmt.Println("Done! extract ", len(jobs), "jobs")
+}
+
+func writeJobs(jobs []extractedJob) {
+	c := make(chan []string)
+	file, err := os.Create("jobs.csv")
+	checkErr(err)
+
+	w := csv.NewWriter(file)
+	defer w.Flush()
+
+	headers := []string{
+		"Id",
+		"Title",
+		"Company",
+		"Location",
+		"Summary",
 	}
-	for url, status := range results {
-		fmt.Println(url, status)
+
+	wErr := w.Write(headers)
+	checkErr(wErr)
+
+	for _, job := range jobs {
+		go writeJobDetail(job, c)
+
+	}
+	for i := 0; i < len(jobs); i++ {
+		jobSlice := <-c
+		jwErr := w.Write(jobSlice)
+		checkErr(jwErr)
 	}
 }
 
-func hitUrl(url string, c chan<- requestResult) {
-	resp, err := http.Get(url)
-	status := "OK"
-	if err != nil || resp.StatusCode >= 400 {
-		status = "FAILED"
+func writeJobDetail(job extractedJob, c chan<- []string) {
+	c <- []string{
+		"https://kr.indeed.com/viewjob?jk=" + job.id + " ",
+		job.title,
+		job.company,
+		job.location,
+		job.summary,
 	}
-	c <- requestResult{url: url, status: status}
+}
+
+func getPage(page int, mainC chan<- []extractedJob) {
+	var jobs []extractedJob
+	c := make(chan extractedJob)
+	pageURL := baseURL + "&start=" + strconv.Itoa(50*page)
+	fmt.Println("Requesting", pageURL)
+	res, err := http.Get(pageURL)
+	checkErr(err)
+	checkStatus(res)
+	defer res.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	checkErr(err)
+
+	searchCard := doc.Find(".jobsearch-SerpJobCard")
+	searchCard.Each(func(i int, card *goquery.Selection) {
+		go extractJob(card, c)
+	})
+	for i := 0; i < searchCard.Length(); i++ {
+		job := <-c
+		jobs = append(jobs, job)
+
+	}
+	mainC <- jobs
+}
+
+func extractJob(card *goquery.Selection, c chan<- extractedJob) {
+	id, _ := card.Attr("data-jk")
+	title := cleanString(card.Find(".title>a").Text())
+	company := cleanString(card.Find(".company").Text())
+	location := cleanString(card.Find(".location").Text())
+	summary := cleanString(card.Find(".summary").Text())
+	c <- extractedJob{
+		id:       id,
+		title:    title,
+		company:  company,
+		location: location,
+		summary:  summary,
+	}
+}
+
+func cleanString(str string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(str)), " ")
+}
+
+func getPages() int {
+
+	pages := 0
+	res, err := http.Get(baseURL)
+	checkErr(err)
+	checkStatus(res)
+
+	defer res.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	checkErr(err)
+
+	doc.Find("#searchCountPages").Each(func(i int, s *goquery.Selection) {
+		re := regexp.MustCompile(`[-]?\d[\d,]*[\.]?[\d{2}]*`)
+		jobs := re.FindAllString(s.Text(), -1)[1]
+		jobs = strings.Replace(jobs, ",", "", -1)
+		num, _ := strconv.Atoi(jobs)
+		pages = num / 50
+		if num%50 != 0 {
+			pages += 1
+		}
+	})
+
+	return pages
+}
+
+func checkErr(err error) {
+	if err != nil {
+		log.Fatalln(err)
+	}
+}
+
+func checkStatus(req *http.Response) {
+	if req.StatusCode != 200 {
+		log.Fatalln("Request failed with Status :", req.StatusCode)
+	}
 }
